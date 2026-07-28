@@ -25,27 +25,64 @@ function configured() {
 
 async function apiGet(action, params) {
   if (!configured()) throw new Error("not_configured");
-  const url = new URL(API_URL);
-  url.searchParams.set("action", action);
-  if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  const res = await fetch(url.toString(), { method: "GET" });
-  const data = await res.json();
-  if (data && data.error) throw new Error(data.error);
-  return data;
+  return apiGetJsonp(action, params);
 }
 
-// text/plain avoids a CORS preflight OPTIONS request, which Apps Script
-// Web Apps don't handle — the server still JSON.parses the raw body.
+// JSONP: load the response as a <script> tag instead of fetch(). Script-tag
+// loads are never subject to CORS — this is the standard, reliable way to
+// read from an Apps Script Web App cross-origin, since a plain fetch() GET
+// can be blocked from reading the response even when the request itself
+// succeeds (this is what was happening: the endpoint worked, the browser
+// just wasn't allowed to hand the JSON back to our JavaScript).
+let jsonpSeq = 0;
+function apiGetJsonp(action, params) {
+  return new Promise((resolve, reject) => {
+    const callbackName = "bmeCb" + (jsonpSeq++) + "_" + Date.now();
+    const script = document.createElement("script");
+
+    const timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new Error("timeout"));
+    }, 15000);
+
+    function cleanup() {
+      clearTimeout(timeoutId);
+      delete window[callbackName];
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+
+    window[callbackName] = (data) => {
+      cleanup();
+      if (data && data.error) reject(new Error(data.error));
+      else resolve(data);
+    };
+
+    const url = new URL(API_URL);
+    url.searchParams.set("action", action);
+    url.searchParams.set("callback", callbackName);
+    if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+
+    script.src = url.toString();
+    script.onerror = () => { cleanup(); reject(new Error("script_load_error")); };
+    document.body.appendChild(script);
+  });
+}
+
+// Writes still use fetch(), but in no-cors mode: the request is genuinely
+// sent and Apps Script really does execute it and update the Sheet — we
+// simply can't read the response back (same underlying CORS limitation as
+// above, and JSONP can't do POST). So we treat "sent without a network
+// error" as success, and rely on refreshing data afterward (via the JSONP
+// reads above, which aren't affected) to reflect what actually happened.
 async function apiPost(action, body) {
   if (!configured()) throw new Error("not_configured");
-  const res = await fetch(API_URL, {
+  await fetch(API_URL, {
     method: "POST",
+    mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify({ action, ...body }),
   });
-  const data = await res.json();
-  if (data && data.error) throw new Error(data.error);
-  return data;
+  return { success: true };
 }
 
 // ---------------------------------------------------------------------
